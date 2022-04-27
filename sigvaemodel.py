@@ -4,8 +4,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import scipy as sp
-
-
+import networkx as nx
+'''
 class GCNLayer(nn.Module):
     def __init__(self, input_dim, output_dim, dropout=0):
         super().__init__()
@@ -62,24 +62,113 @@ class GCN(nn.Module):
         
         #Return shape : (N,D)
         return temp
-
-#input_dim : M in paper
-#input_dim_noise : epsilon's dimension
-#output_dim : D in paper
-class SIGVAE(nn.Module):
-    def __init__(self, L, input_dim, numNodes,input_dim_noise=64, hidden_dim=32, output_dim=16, dropout=0) :
-        super().__init__()
-        self.GCNuNetworks=nn.ModuleList()
-        for i in range(L):
-            self.GCNuNetworks.append(GCN(input_dim_noise+input_dim+output_dim, hidden_dim, output_dim, dropout))
-        #self.GCNu=GCN(input_dim_noise, hidden_dim, output_dim, dropout)
-        self.GCNmu=GCN(input_dim, hidden_dim, output_dim, dropout)
-        self.GCNsigma=GCN(input_dim, hidden_dim, output_dim, dropout)
+'''
+def graph_generator(self, A, X):
+        tempGraph=nx.from_numpy_array(A)
+        
+        for index in A.size(0):
+            tempGraph.nodes[index]=X[index]
+        tempGraph=tempGraph.to_directed()
+        
+        finalGraph=dgl.from_networkx(tempGraph, node_attrs=['node_feature'], edge_attrs=['weight'])
+        return finalGraph
+    
+#output_dims=[output dim of 1st layer, output dim of 2nd layer, ..., D]
+class GIN(nn.Module):
+    def __init__(self, L, output_dims, activation=torch.nn.ReLU,dropout=0):
+        super(GIN, self).__init__()
+        self.numLayer=L
+        self.output_dims=output_dims
+        self.activation=activation
+        self.GINLayers=nn.ModuleList()
+        self.dropoutRate=dropout
+        
+        if self.output_dims.size(0)!=L:
+            raise Exception("number of layer not matched to output dimensions")
+        
+        self.GINLayers.append(dgl.nn.GINConv(apply_func=nn.Linear(L,output_dims[0]), aggregator_type="sum", init_eps=0, learn_eps=True,activation=self.activation))
+        for i in range(L-1):
+            self.GINLayers.append(dgl.nn.GINConv(apply_func=nn.Linear(output_dims[i], output_dims[i+1]),aggregator_type="sum", init_eps=0, learn_eps=True,activation=self.activation))
+    
+    #Generating dgl.graph from adjacency matrix & feature matrix
+    #node_features : feature matrix
+    
+    def forward(self, A, X, epsilon_dim, h):
+        self.adjMatrix=A
+        self.featMatrix=X
+        self.N=X.size(0)
+        self.noise_dim=epsilon_dim
+        self.h=h
+        
+        #epsilon generation
+        Bernoulli=torch.distributions.Bernoulli(torch.tensor[0.5])
+        epsilon=Bernoulli.rsample(torch.Size([self.N,self.noise_dim]))
+        
+        temp=torch.cat((self.featMatrix,epsilon,h),1) #shape : (N, M+64+D)
+        
+        self.adjMatrixNumpy=torch.clone(self.adjMatrix).numpy()
+        self.tempNumpy=torch.clone(self.temp).numpy()
+        self.inputGraphGIN=graph_generator(self.adjMatrixNumpy, self.tempNumpy) 
+       
+        for layer in self.GINLayers:
+            temp=layer.forward(self.inputGraphGIN, temp, edge_weight=None)
+        
+        #Return shape : (N,D)
+        return temp
+    
+class InnerProductDecoder(nn.Module):
+    def __init__(self, dropout=0, activation=nn.Sigmoid):
+        super(InnerProductDecoder, self).__init__()
+        self.activation=activation
+        self.dropout=nn.Dropout(dropout)
+        
+    def runDecoder(self, Z):
+        Z=self.dropout(Z)
+        temp=torch.transpose(torch.clone(Z), 0, 1)
+        result=torch.mm(Z,temp)
+        return self.activation(result)
+    
+class BPDecoder(nn.Module):
+    def __init__(self, distribution=torch.distributions.Poisson,dropout=0):
+        super(BPDecoder, self).__init__()
+        self.dropout=nn.Dropout(dropout)
+        
+    def runDecoder(self, Z, R):
+        self.R=R
+        Z=self.dropout(Z)
+        temp=torch.transpose(torch.clone(Z), 0, 1)
+        sigmaInput=torch.diag(R)*torch.mm(Z, temp)
+        lambdaterm=torch.exp(torch.sum(sigmaInput))
+        return 1-torch.exp(-1*lambdaterm)
+#Lu : number of layers of each GIN in GINuNetworks (same for every GIN)
+#Lmu : number of layers of GINmu
+#Lsigma : number of layers of GINsigma
+#output_dim_matrix_u : matrix made by concatenating output_dim vector of each GIN in GINuNetworks (axis=1)
+#output_dim_mu : output_dim vector of GINmu
+#output_dim_sigma : output_dim vector of GINsigma
+class Encoder(nn.Module):
+    def __init__(self, Lu, Lmu, Lsigma, output_dim_matrix_u, output_dim_mu, output_dim_sigma, activation=nn.ReLU, dropout=0) :
+        super(Encoder, self).__init__()
+        self.GINuNetworks=nn.ModuleList()
+        for i in range(Lu):
+            self.GINuNetworks.append(GIN(Lu, output_dims=output_dim_matrix_u[i], activation=nn.ReLU, dropout=0))
+        self.GINmu=GIN(Lmu, output_dims=output_dim_mu, activation=lambda x : x, dropout=0)
+        self.GINsigma=GIN(Lsigma, output_dims=output_dim_sigma, activation=lambda x : x, dropout=0)
         
         
-    def forward(self, A, X):
+    def encode(self, A, X):
         h=0
-        for GCNu in self.GCNuNetworks:
-            h=GCNu.forward(A, X, 64 ,h)
-        self.GCNmu.forward(A, X, 0, h)
-        self.GCNsigma.forward(A, X, 0, h)
+        for GINu in self.GINuNetworks:
+            h=GINu.forward(A, X, 64, h)
+        hL=torch.clone(h)
+        self.mu=self.GINmu.forward(A, X, 0, hL)
+        self.sigma=torch.exp(self.GINsigma.forward(A, X, 0, hL))
+        #self.q=1
+        #for index in range(X.size(0)):
+        #    qzi=torch.distributions.Normal(loc=self.mu[index], covariance_matrix=torch.diag(self.sigma[index]))
+        #    zi=qzi.rsample()
+        
+        #sample_n in the original tensorflow code
+        param=torch.normal(mean=0, std=1)
+        Z=self.mu+param*self.sigma
+        return Z         
