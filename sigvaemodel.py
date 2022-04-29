@@ -117,21 +117,23 @@ class GIN(nn.Module):
         return temp
     
 class InnerProductDecoder(nn.Module):
-    def __init__(self, dropout=0, activation=nn.Sigmoid):
+    def __init__(self, distribution=torch.distributions.RelaxedBernoulli,dropout=0, activation=nn.Sigmoid):
         super(InnerProductDecoder, self).__init__()
         self.activation=activation
         self.dropout=nn.Dropout(dropout)
-        
+        self.distribution=distribution
     def runDecoder(self, Z):
         Z=self.dropout(Z)
         temp=torch.transpose(torch.clone(Z), 0, 1)
         result=torch.mm(Z,temp)
-        return self.activation(result)
+        A=self.distribution(temp=1,logits=self.activation(result))
+        return A
     
 class BPDecoder(nn.Module):
-    def __init__(self, distribution=torch.distributions.Poisson,dropout=0):
+    def __init__(self, distribution=torch.distributions.RelaxedBernoulli,dropout=0):
         super(BPDecoder, self).__init__()
         self.dropout=nn.Dropout(dropout)
+        self.distribution=distribution
         
     def runDecoder(self, Z, R):
         self.R=R
@@ -139,7 +141,8 @@ class BPDecoder(nn.Module):
         temp=torch.transpose(torch.clone(Z), 0, 1)
         sigmaInput=torch.diag(R)*torch.mm(Z, temp)
         lambdaterm=torch.exp(torch.sum(sigmaInput))
-        return 1-torch.exp(-1*lambdaterm)
+        A=self.distribution(temp=1, logits=1-torch.exp(-1*lambdaterm))
+        return A
 #Lu : number of layers of each GIN in GINuNetworks (same for every GIN)
 #Lmu : number of layers of GINmu
 #Lsigma : number of layers of GINsigma
@@ -172,3 +175,33 @@ class Encoder(nn.Module):
         param=torch.normal(mean=0, std=1)
         Z=self.mu+param*self.sigma
         return Z         
+    
+class SIGVAE_GIN(nn.Module):
+    def __init__(self, Lu, Lmu, Lsigma, output_dim_matrix_u, output_dim_mu, output_dim_sigma, decoder_type, Rmatrix, activation=nn.ReLU, dropout=0):
+        super(SIGVAE_GIN, self)._init__()
+        self.decoder_type=decoder_type
+        self.Rmatrix=Rmatrix
+        self.encoder=Encoder(Lu, Lmu, Lsigma, output_dim_matrix_u, output_dim_mu, output_dim_sigma, activation=activation, dropout=dropout)
+        if self.decoder_type=="inner":
+            self.decoder=InnerProductDecoder(dropout=dropout, distribution=torch.distributions.RelaxedBernoulli,activation=nn.Sigmoid)
+        if self.decoder_type=="bp":
+            self.decoder=BPDecoder(dropout=dropout, distribution=torch.distributions.RelaxedBernoulli)
+    
+    def forward(self, adj_matrix, feat_matrix):
+        self.latent_representation=self.encoder.encode(adj_matrix, feat_matrix)
+        if self.decoder_type=="inner":
+            self.generated_result=self.decoder.runDecoder(self.latent_representation)
+        if self.decoder_type=="bp":
+            self.generated_result=self.decoder.runDecoder(self.latent_representation, self.Rmatrix)
+            
+        return self.latent_representation, self.generated_result
+    
+    #VAE loss : https://github.com/kampta/pytorch-distributions/blob/master/binconcrete_vae.py
+    def loss(self, input, reconstructed_input, mu, prior, eps=1e-10):
+        temp=torch.distributions.Bernoulli(logits=reconstructed_input)
+        BCE=-1*temp.log_prob(input.view(-1,input.size(0))).sum()
+        temp1=mu*((mu+eps)/prior).log()
+        temp2=(1-mu)*((1-mu+eps)/(1-prior)).log()
+        KLD=torch.sum(temp1+temp2,dim=-1).sum()
+        
+        return BCE + KLD
