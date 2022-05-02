@@ -174,7 +174,9 @@ class Encoder(nn.Module):
         #sample_n in the original tensorflow code
         param=torch.normal(mean=0, std=1)
         Z=self.mu+param*self.sigma
-        return Z         
+        
+        qz=torch.distributions.normal.Normal(self.mu, self.sigma)
+        return Z, qz
     
 class SIGVAE_GIN(nn.Module):
     def __init__(self, Lu, Lmu, Lsigma, output_dim_matrix_u, output_dim_mu, output_dim_sigma, decoder_type, Rmatrix, activation=nn.ReLU, dropout=0):
@@ -196,12 +198,10 @@ class SIGVAE_GIN(nn.Module):
             
         return self.latent_representation, self.generated_result
     
-    #VAE loss : https://github.com/kampta/pytorch-distributions/blob/master/binconcrete_vae.py
-    def loss(self, input, reconstructed_input, mu, prior, eps=1e-10):
-        temp=torch.distributions.Bernoulli(logits=reconstructed_input)
-        BCE=-1*temp.log_prob(input.view(-1,input.size(0))).sum()
-        temp1=mu*((mu+eps)/prior).log()
-        temp2=(1-mu)*((1-mu+eps)/(1-prior)).log()
-        KLD=torch.sum(temp1+temp2,dim=-1).sum()
+    #VAE loss : https://github.com/kampta/pytorch-distributions/blob/master/gaussian_vae.py
+    def loss(self, input, reconstructed_input, qz):
+        BCE=nn.Functional.binary_cross_entropy(reconstructed_input, input.view(-1, input.size(0)), reduction='sum')
+        pz=torch.normal.Normal(torch.zeros_like(qz.loc), torch.ones_like(qz.scale))
+        KLD=torch.distributions.kl_divergence(qz, pz).sum()
         
         return BCE + KLD
