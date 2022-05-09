@@ -1,3 +1,4 @@
+from inspect import Parameter
 import dgl
 import pandas as pd
 import numpy as np
@@ -5,203 +6,273 @@ import torch
 import torch.nn as nn
 import scipy as sp
 import networkx as nx
-'''
-class GCNLayer(nn.Module):
-    def __init__(self, input_dim, output_dim, dropout=0):
-        super().__init__()
-        self.input_dim=input_dim
-        self.output_dim=output_dim
-        self.dropout=torch.nn.Dropout(p=dropout)
-        self.layer=nn.Linear(input_dim, output_dim, bias=False)
-        self.layer.reset_parameters()
-        
-    def forward(self, X, A):
-        X=self.dropout(X)
-        self.A=A+torch.eye(A.size(0))
-        Dhat=torch.diag(torch.diagonal(self.A,0)) #(N,N)
-        temp=self.layer(torch.mm(self.A,X)) #(N,M)
-        DhatPowerHalf=sp.linalg.fractional_matrix_power(Dhat, (-1/2)) #(N,N)
-        #return shape : (N,M)
-        return nn.ReLU(torch.mm(torch.mm(torch.mm(DhatPowerHalf, self.A), DhatPowerHalf), temp))
 
-        
-#GNN template in SIGVAE
-#1 stochastic layer of size 32 + 1 GCN layer of size 16 models mu
-#Stochastic layer : epsilon related GCN layer (noise injection layer)
-class GCN(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0):
-        super().__init__()
-        #self.adjMatrix=A
-        #self.featMatrix=X #shape : (N,M)
-        #self.N=X.size(0)
-        
-        self.GCNLayers=nn.ModuleList()
-        self.input_dim=input_dim
-        self.hidden_dim=hidden_dim
-        self.output_dim=output_dim
-        self.dropoutRate=dropout
-        #self.epsilon=epsilon
-        self.GCNLayers.append(GCNLayer(input_dim,hidden_dim,self.dropoutRate))
-        self.GCNLayers.append(GCNLayer(hidden_dim,output_dim,self.dropoutRate))    
-        
-    def forward(self, A, X, epsilon_dim, h):
-        self.adjMatrix=A
-        self.featMatrix=X
-        self.N=X.size(0)
-        self.noise_dim=epsilon_dim
-        self.h=h #shape : (N,D)
-        
-        Bernoulli=torch.distributions.Bernoulli(torch.tensor[0.5])
-        epsilon=Bernoulli.rsample(torch.Size([self.N,self.noise_dim]))
-        
-        temp=torch.cat((self.featMatrix,epsilon,h),1) #shape : (N, M+64+D)
-        #fcn=nn.Linear(self.output_dim, self.fc_dim)
-        for layer in self.GCNLayers:
-            temp=layer.forward(temp, A)
-        #temp=fcn(temp)
-        
-        #Return shape : (N,D)
-        return temp
-'''
-def graph_generator(self, A, X):
-        tempGraph=nx.from_numpy_array(A)
-        
-        for index in A.size(0):
-            tempGraph.nodes[index]=X[index]
-        tempGraph=tempGraph.to_directed()
-        
-        finalGraph=dgl.from_networkx(tempGraph, node_attrs=['node_feature'], edge_attrs=['weight'])
-        return finalGraph
+#Generating dgl.graph from adjacency matrix & feature matrix
+#node_features : feature matrix
+#subX : dimension 1,2 of input matrix of GIN - do not consider sample size
+def graph_generator(A, subX):
+    tempGraph=nx.from_numpy_array(A)
     
+    for index in A.size(0):
+        tempGraph.nodes[index]=subX[index]
+    tempGraph=tempGraph.to_directed()
+        
+    finalGraph=dgl.from_networkx(tempGraph, node_attrs=['node_feature'], edge_attrs=['weight'])
+    return finalGraph
+
+#Shape of X : [sample_size, N, M]
 #output_dims=[output dim of 1st layer, output dim of 2nd layer, ..., D]
+#GINConv : Readout not implemented - we should apply readout to the result
+#Shape of final result : [sample_size, N, D]
 class GIN(nn.Module):
-    def __init__(self, L, output_dims, activation=torch.nn.ReLU,dropout=0):
+    def __init__(self, L, input_dim, output_dims, noise_dim, sample_size, activation, dropout=0):
         super(GIN, self).__init__()
         self.numLayer=L
+        self.input_dim=input_dim
         self.output_dims=output_dims
+        self.noise_dim=noise_dim
         self.activation=activation
         self.GINLayers=nn.ModuleList()
         self.dropoutRate=dropout
+        self.sample_size=sample_size
         
         if self.output_dims.size(0)!=L:
             raise Exception("number of layer not matched to output dimensions")
         
-        self.GINLayers.append(dgl.nn.GINConv(apply_func=nn.Linear(L,output_dims[0]), aggregator_type="sum", init_eps=0, learn_eps=True,activation=self.activation))
+        self.GINLayers.append(dgl.nn.GINConv(apply_func=nn.Linear(self.input_dim+self.noise_dim,self.output_dims[0]), aggregator_type="sum", init_eps=0, learn_eps=True,activation=self.activation))
         for i in range(L-1):
-            self.GINLayers.append(dgl.nn.GINConv(apply_func=nn.Linear(output_dims[i], output_dims[i+1]),aggregator_type="sum", init_eps=0, learn_eps=True,activation=self.activation))
+            self.GINLayers.append(dgl.nn.GINConv(apply_func=nn.Linear(self.output_dims[i], self.output_dims[i+1]),aggregator_type="sum", init_eps=0, learn_eps=True,activation=self.activation))
     
-    #Generating dgl.graph from adjacency matrix & feature matrix
-    #node_features : feature matrix
-    
-    def forward(self, A, X, epsilon_dim, h):
+    def forward(self, A, X, h):
         self.adjMatrix=A
         self.featMatrix=X
-        self.N=X.size(0)
-        self.noise_dim=epsilon_dim
+        self.N=X.size(1)
         self.h=h
+        #self.X1=torch.tile(torch.unsqueeze(X, axis=1), [1,K,1]) #(N,K,M)
+        
+        if X.size(0)!=self.sample_size:
+            raise Exception("sample size not matched to the input.shape[0]")
         
         #epsilon generation
         Bernoulli=torch.distributions.Bernoulli(torch.tensor[0.5])
-        epsilon=Bernoulli.rsample(torch.Size([self.N,self.noise_dim]))
+        if self.noise_dim>0:
+            epsilon=Bernoulli.rsample(torch.Size(self.sample_size, self.N, self.noise_dim))
+            #epsilon=Bernoulli.rsample(torch.Size([self.N,self.K,self.noise_dim]))
+            temp=torch.cat((self.featMatrix, epsilon, h), 1)
+            #temp=torch.cat((epsilon,self.X1),axis=2) #shape : (N, K, M+noise_dim)
+        else:
+            zeroeps=torch.zeros(self.sample_size, self.N, self.noise_dim)
+            temp=torch.cat((self.featMatrix, zeroeps, h), 1)
         
-        temp=torch.cat((self.featMatrix,epsilon,h),1) #shape : (N, M+64+D)
+        if self.sample_size>=1:
+            outputTensor=torch.zeros([self.sample_size])
+            self.adjMatrixNumpy=torch.clone(self.adjMatrix).numpy()
+            for i in range(self.sample_size):
+                self.tempNumpy=torch.clone(temp[i,:,:]).numpy()
+                self.inputGraphGIN=graph_generator(self.adjMatrixNumpy, self.tempNumpy) 
+                for layer in self.GINLayers:       
+                    temp=layer.forward(self.inputGraphGIN, temp, edge_weight=None)
+                    temp=torch.mean(temp, dim=0) #Mean READOUT
+                outputTensor[i]=temp
         
-        self.adjMatrixNumpy=torch.clone(self.adjMatrix).numpy()
-        self.tempNumpy=torch.clone(self.temp).numpy()
-        self.inputGraphGIN=graph_generator(self.adjMatrixNumpy, self.tempNumpy) 
-       
-        for layer in self.GINLayers:
-            temp=layer.forward(self.inputGraphGIN, temp, edge_weight=None)
-        
-        #Return shape : (N,D)
-        return temp
-    
+        #for GINmu and GINsigma
+        if self.sample_size==0:
+            self.adjMatrixNumpy=torch.clone(self.adjMatrix).numpy()
+            self.inputGraphGIN=graph_generator(self.adjMatrixNumpy, self.tempNumpy) 
+            for layer in self.GINLayers:       
+                temp=layer.forward(self.inputGraphGIN, temp, edge_weight=None)
+                temp=torch.mean(temp, dim=0) #Mean READOUT
+            outputTensor=temp
+        #Return shape : (sample_size, N,D) for GINu / (N,D) for GINmu and GINsigma
+        return self.activation(outputTensor)
+
+#output : reconstructed adjacency amtrix
 class InnerProductDecoder(nn.Module):
-    def __init__(self, distribution=torch.distributions.RelaxedBernoulli,dropout=0, activation=nn.Sigmoid):
+    def __init__(self, dropout=0):
         super(InnerProductDecoder, self).__init__()
-        self.activation=activation
+        #self.activation=activation
         self.dropout=nn.Dropout(dropout)
-        self.distribution=distribution
+        #self.distribution=distribution
+        
+    #return logit
     def runDecoder(self, Z):
         Z=self.dropout(Z)
-        temp=torch.transpose(torch.clone(Z), 0, 1)
+        temp=torch.transpose(torch.clone(Z), 1, 2)
         result=torch.mm(Z,temp)
-        A=self.distribution(temp=1,logits=self.activation(result))
-        return A
+        #A=self.distribution(temp=1,logits=self.activation(result))
+        return torch.nn.Sigmoid(result), Z
     
 class BPDecoder(nn.Module):
-    def __init__(self, distribution=torch.distributions.RelaxedBernoulli,dropout=0):
+    def __init__(self, z_dim, dropout=0):
         super(BPDecoder, self).__init__()
         self.dropout=nn.Dropout(dropout)
-        self.distribution=distribution
-        
+        self.z_dim=z_dim
+        #self.distribution=distribution
+        self.rk_logit=Parameter(torch.FloatTensor(torch.size([z_dim, z_dim])))
+    #return logit
     def runDecoder(self, Z, R):
-        self.R=R
+        self.rk=torch.nn.Sigmoid(self.rk_logit)
         Z=self.dropout(Z)
-        temp=torch.transpose(torch.clone(Z), 0, 1)
-        sigmaInput=torch.diag(R)*torch.mm(Z, temp)
+        temp=torch.transpose(torch.clone(Z), 1, 2)
+        sigmaInput=self.rk.view(1, self.z_dim, self.z_dim)*torch.mm(Z, temp)
         lambdaterm=torch.exp(torch.sum(sigmaInput))
-        A=self.distribution(temp=1, logits=1-torch.exp(-1*lambdaterm))
-        return A
-#Lu : number of layers of each GIN in GINuNetworks (same for every GIN)
+        #A=self.distribution(temp=1, logits=1-torch.exp(-1*lambdaterm))
+        return 1-torch.exp(-1*lambdaterm), Z
+    
+#Lu : number of layers of GINu
 #Lmu : number of layers of GINmu
 #Lsigma : number of layers of GINsigma
 #output_dim_matrix_u : matrix made by concatenating output_dim vector of each GIN in GINuNetworks (axis=1)
 #output_dim_mu : output_dim vector of GINmu
 #output_dim_sigma : output_dim vector of GINsigma
 class Encoder(nn.Module):
-    def __init__(self, Lu, Lmu, Lsigma, output_dim_matrix_u, output_dim_mu, output_dim_sigma, activation=nn.ReLU, dropout=0) :
+    def __init__(self, Lu, Lmu, Lsigma, input_dim, output_dim_u, output_dim_mu, output_dim_sigma, K, J, noise_dim=64, activation=nn.ReLU, dropout=0) :
         super(Encoder, self).__init__()
-        self.GINuNetworks=nn.ModuleList()
-        for i in range(Lu):
-            self.GINuNetworks.append(GIN(Lu, output_dims=output_dim_matrix_u[i], activation=nn.ReLU, dropout=0))
-        self.GINmu=GIN(Lmu, output_dims=output_dim_mu, activation=lambda x : x, dropout=0)
-        self.GINsigma=GIN(Lsigma, output_dims=output_dim_sigma, activation=lambda x : x, dropout=0)
+        self.K=K
+        self.J=J
+        self.noise_dim=noise_dim
+        self.GINu=GIN(Lu, input_dim=input_dim, output_dims=output_dim_u, noise_dim=noise_dim, sample_size=(self.K+self.J), activation=activation, dropout=0)
+        self.GINmu=GIN(Lmu, input_dim=output_dim_u, output_dims=output_dim_mu, noise_dim=0, sample_size=0, activation=lambda x : x, dropout=0)
+        self.GINsigma=GIN(Lsigma, input_dim=output_dim_u, output_dims=output_dim_sigma, noise_dim=0, sample_size=0, activation=lambda x : x, dropout=0)
         
         
     def encode(self, A, X):
         h=0
-        for GINu in self.GINuNetworks:
-            h=GINu.forward(A, X, 64, h)
+        h=self.GINu.forward(A, X, h)
         hL=torch.clone(h)
-        self.mu=self.GINmu.forward(A, X, 0, hL)
-        self.sigma=torch.exp(self.GINsigma.forward(A, X, 0, hL))
-        #self.q=1
-        #for index in range(X.size(0)):
-        #    qzi=torch.distributions.Normal(loc=self.mu[index], covariance_matrix=torch.diag(self.sigma[index]))
-        #    zi=qzi.rsample()
+        #hL's shape : (K+J, N, output_dim_u)
+        self.mu=self.GINmu.forward(A, X, hL)
+        self.sigma=torch.exp(self.GINsigma.forward(A, X, hL)/2.0)
+        
+        embedding_mu=self.mu[self.K:,:]
+        embedding_sigma=self.sigma[self.K:,:]
+        
+        if len(embedding_mu.shape)!=len(embedding_sigma.shape):
+            raise Exception("mu and sigma have different dimensions")
         
         #sample_n in the original tensorflow code
         param=torch.normal(mean=0, std=1)
         Z=self.mu+param*self.sigma
         
+<<<<<<< HEAD
+        return Z, self.mu, self.sigma
+=======
         qz=torch.distributions.normal.Normal(self.mu, self.sigma)
         return Z, qz
+>>>>>>> 19f1df3acf29006ec1e4ba40d102f92e1a21cb2a
     
 class SIGVAE_GIN(nn.Module):
-    def __init__(self, Lu, Lmu, Lsigma, output_dim_matrix_u, output_dim_mu, output_dim_sigma, decoder_type, Rmatrix, activation=nn.ReLU, dropout=0):
+    def __init__(self, Lu, Lmu, Lsigma, input_dim, output_dim_u, output_dim_mu, output_dim_sigma, Rmatrix, K, J, noise_dim=64, decoder_type="inner", activation=nn.ReLU, dropout=0):
         super(SIGVAE_GIN, self)._init__()
         self.decoder_type=decoder_type
         self.Rmatrix=Rmatrix
-        self.encoder=Encoder(Lu, Lmu, Lsigma, output_dim_matrix_u, output_dim_mu, output_dim_sigma, activation=activation, dropout=dropout)
+        self.encoder=Encoder(Lu, Lmu, Lsigma, input_dim, output_dim_u, output_dim_mu, output_dim_sigma, K, J, noise_dim=64, activation=activation, dropout=dropout)
+        self.K=K
+        self.J=J
+        self.noise_dim=noise_dim #ndim in sigvae-torch
+        #to make hiddenx + hiddene equivalent to x||e
+        self.reweight=((self.noise_dim+output_dim_u) / (input_dim+output_dim_u))**(0.5)    
+        
         if self.decoder_type=="inner":
             self.decoder=InnerProductDecoder(dropout=dropout, distribution=torch.distributions.RelaxedBernoulli,activation=nn.Sigmoid)
         if self.decoder_type=="bp":
             self.decoder=BPDecoder(dropout=dropout, distribution=torch.distributions.RelaxedBernoulli)
-    
+
     def forward(self, adj_matrix, feat_matrix):
-        self.latent_representation=self.encoder.encode(adj_matrix, feat_matrix)
+        self.adj_matrix=adj_matrix
+        self.feat_matrix=feat_matrix
+        self.latent_representation, self.mu, self.sigma=self.encoder.encode(adj_matrix, feat_matrix)
         if self.decoder_type=="inner":
-            self.generated_result=self.decoder.runDecoder(self.latent_representation)
+            self.generated_prob, self.Z=self.decoder.runDecoder(self.latent_representation)
         if self.decoder_type=="bp":
-            self.generated_result=self.decoder.runDecoder(self.latent_representation, self.Rmatrix)
+            self.generated_prob, self.Z=self.decoder.runDecoder(self.latent_representation, self.Rmatrix)
             
         return self.latent_representation, self.generated_result
     
     #VAE loss : https://github.com/kampta/pytorch-distributions/blob/master/gaussian_vae.py
     def loss(self, input, reconstructed_input, qz):
+<<<<<<< HEAD
+        K=2000
+        J=150
+        eps=1e-10
+        train_xs_shape=784
+        N=self.adj_matrix.size(0)
+        adj_train=self.adj_matrix
+        
+        #Drawing K samples from q(psi|X,A) - final shape : (N, K, J+1, 16=output_dim_mu=output_dim_sigma)
+        #J+1 copy of samples of shape (N, K, 16)
+        #z_logv : output of GIN network
+        #sigma_iw1 : sigma of qphi - since z_logv=log(sigma^2) 
+        #psi_iw : output of GIN network - mu of qphi
+        #Not explicitly evaluating qphi - implicit approach 
+        z_logv=self.sigma #(N, output_dim_sigma[-1])
+        z_logv_iw=torch.tile(torch.unsqueeze(z_logv, 1), [1,K,1]) #(N, K, output_dim_mu[-1])
+        sigma_iw1=torch.exp(z_logv_iw.type(torch.FloatTensor)/2) 
+        sigma_iw2=torch.tile(torch.unsqueeze(sigma_iw1, axis=2), [1, 1, J+1, 1]) #(N, K, J+1, output_dim_mu[-1])
+        psi_iw=self.mu #(N, K, output_dim_mu[-1]==output_dim_sigma[-1]) - original paper shape
+        psi_iw_vec=torch.mean(psi_iw, axis=1)
+        param=torch.normal(mean=0, std=1)
+        #sampling Z from q(Z|psi) - z_sample_iw is equal to the Z in the paper
+        z_sample_iw=self.mu+param*sigma_iw1 #(N, K, output_dim_mu[-1])
+        z_sample_iw2=torch.tile(torch.unsqueeze(z_sample_iw, axis=2), [1, 1, J+1, 1]) #(N, K, J+1, output_dim_mu[-1])
+
+        #reuse=True => sample from same distribution => another sample of mu of qphi
+        psi_iw_star=self.encoder.GINmu.forward(self.adj_matrix, self.feat_matrix, 0, self.encoder.GINu.forward(self.adj_matrix, self.feat_matrix, J, 0)) #(N, J, output_dim_mu[-1])  
+        psi_iw_star1=torch.tile(torch.unsqueeze(psi_iw_star,axis=1), [1,K,1,1]) #(N, K, J, output_dim_mu[-1])
+        psi_iw_star2=torch.cat([psi_iw_star1, torch.unsqueeze(psi_iw, axis=2)],2) #(N, K, J+1, output_dim_mu[-1])
+        
+        #Bayesian kernel of normal distribution
+        #https://namyoungkim.github.io/statistics/2017/09/18/probability/
+        ker=torch.exp(-0.5 * torch.sum(torch.square(z_sample_iw2-psi_iw_star2)/torch.square(sigma_iw2+eps),3)) #(N, K, J+1)
+        
+        
+        log_H_iw_vec=torch.log(torch.mean(ker, axis=2)+eps)-0.5*torch.sum(z_logv_iw, 2) #(N,K)
+        log_H_iw=torch.mean(log_H_iw_vec, axis=0) #(K)
+        
+        log_prior_iw_vec=-0.5*torch.sum(torch.square(z_sample_iw),2) #(N,K)
+        log_prior_iw=torch.mean(log_prior_iw_vec, axis=0)  #(K)
+        
+        x=torch.randn(self.adj_matrix.size(0), train_xs_shape)
+        x_iw=torch.tile(torch.unsqueeze(x, axis=1),[1,K,1]) #(N, K, 784)
+        
+        for i in range(K):
+            input_=torch.squeeze(z_sample_iw[:,i,:])
+            logits_x=torch.nn.Sigmoid(self.decoder.runDecoder(input_))
+            if i==0:
+                outputs=torch.unsqueeze(logits_x, axis=2)
+            else:
+                outputs=torch.cat([outputs, torch.unsqueeze(logits_x, axis=2)], axis=2)
+        
+        logits_x_iw=outputs #(N, N, K) 
+        reconstruct_iw=logits_x_iw
+        
+        adjacency_orig_dense=adj_train+torch.eye(adj_train.shape[0])
+        adj_orig_tile=torch.unsqueeze(adjacency_orig_dense, -1)
+        adj_orig_tile=torch.tile(adj_orig_tile, mutiplies=[1,1,K]) #(N,N,K)
+        
+        pos_weight = float(self.adj_matrix.shape[0] * self.adj_matrix.shape[0] - self.adj_matrix.sum()) / self.adj_matrix.sum()
+        norm = self.adj_matrix.shape[0] * self.adj_matrix.shape[0] / float((self.adj_matrix.shape[0] * self.adj_matrix.shape[0] - self.adj_matrix.sum()) * 2)
+        
+        #weighted_cross_entropy_with_logits
+        #logit : reconstruct_iw
+        
+        log_lik_iw = -1 * norm * torch.mean(
+            (1-adj_orig_tile)*reconstruct_iw + 
+            (1+(pos_weight-1)*adj_orig_tile)*
+            torch.log(1+torch.exp(-1*abs(reconstruct_iw))+
+            max(-1*reconstruct_iw,0)),axis=[0,1]) #K
+        
+        loss_iw0=-torch.log(torch.sum(torch.exp(log_lik_iw+(log_prior_iw-log_H_iw)*0/N))) + torch.log(K.type(torch.Float32))
+        loss_iw=loss_iw0
+        #BCE=nn.Functional.binary_cross_entropy(reconstructed_input, input.view(-1, input.size(0)), reduction='mean')
+        #pz=torch.normal.Normal(torch.zeros_like(qz.loc), torch.ones_like(qz.scale))
+        #KLD=torch.distributions.kl_divergence(qz, pz).mean()
+        
+        #return BCE + KLD
+=======
         BCE=nn.Functional.binary_cross_entropy(reconstructed_input, input.view(-1, input.size(0)), reduction='sum')
         pz=torch.normal.Normal(torch.zeros_like(qz.loc), torch.ones_like(qz.scale))
         KLD=torch.distributions.kl_divergence(qz, pz).sum()
         
         return BCE + KLD
+>>>>>>> 19f1df3acf29006ec1e4ba40d102f92e1a21cb2a
