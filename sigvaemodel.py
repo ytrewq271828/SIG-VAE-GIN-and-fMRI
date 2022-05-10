@@ -61,8 +61,8 @@ class GIN(nn.Module):
             temp=torch.cat((self.featMatrix, epsilon, h), 1)
             #temp=torch.cat((epsilon,self.X1),axis=2) #shape : (N, K, M+noise_dim)
         else:
-            zeroeps=torch.zeros(self.sample_size, self.N, self.noise_dim)
-            temp=torch.cat((self.featMatrix, zeroeps, h), 1)
+            epsilon=torch.zeros(self.sample_size, self.N, self.noise_dim)
+            temp=torch.cat((self.featMatrix, epsilon, h), 1)
         
         if self.sample_size>=1:
             outputTensor=torch.zeros([self.sample_size])
@@ -84,7 +84,7 @@ class GIN(nn.Module):
                 temp=torch.mean(temp, dim=0) #Mean READOUT
             outputTensor=temp
         #Return shape : (sample_size, N,D) for GINu / (N,D) for GINmu and GINsigma
-        return self.activation(outputTensor)
+        return self.activation(outputTensor), epsilon
 
 #output : reconstructed adjacency amtrix
 class InnerProductDecoder(nn.Module):
@@ -138,11 +138,11 @@ class Encoder(nn.Module):
         
     def encode(self, A, X):
         h=0
-        h=self.GINu.forward(A, X, h)
+        h, epsilon=self.GINu.forward(A, X, h)
         hL=torch.clone(h)
         #hL's shape : (K+J, N, output_dim_u)
-        self.mu=self.GINmu.forward(A, X, hL)
-        self.sigma=torch.exp(self.GINsigma.forward(A, X, hL)/2.0)
+        self.mu, zero_eps=self.GINmu.forward(A, X, hL)
+        self.sigma, zero_eps=torch.exp(self.GINsigma.forward(A, X, hL)/2.0)
         
         embedding_mu=self.mu[self.K:,:]
         embedding_sigma=self.sigma[self.K:,:]
@@ -154,12 +154,7 @@ class Encoder(nn.Module):
         param=torch.normal(mean=0, std=1)
         Z=self.mu+param*self.sigma
         
-<<<<<<< HEAD
-        return Z, self.mu, self.sigma
-=======
-        qz=torch.distributions.normal.Normal(self.mu, self.sigma)
-        return Z, qz
->>>>>>> 19f1df3acf29006ec1e4ba40d102f92e1a21cb2a
+        return Z, self.mu, self.sigma, epsilon
     
 class SIGVAE_GIN(nn.Module):
     def __init__(self, Lu, Lmu, Lsigma, input_dim, output_dim_u, output_dim_mu, output_dim_sigma, Rmatrix, K, J, noise_dim=64, decoder_type="inner", activation=nn.ReLU, dropout=0):
@@ -174,24 +169,31 @@ class SIGVAE_GIN(nn.Module):
         self.reweight=((self.noise_dim+output_dim_u) / (input_dim+output_dim_u))**(0.5)    
         
         if self.decoder_type=="inner":
-            self.decoder=InnerProductDecoder(dropout=dropout, distribution=torch.distributions.RelaxedBernoulli,activation=nn.Sigmoid)
+            self.decoder=InnerProductDecoder(dropout=dropout)
         if self.decoder_type=="bp":
-            self.decoder=BPDecoder(dropout=dropout, distribution=torch.distributions.RelaxedBernoulli)
+            self.decoder=BPDecoder(z_dim=output_dim_mu, dropout=dropout)
 
     def forward(self, adj_matrix, feat_matrix):
         self.adj_matrix=adj_matrix
         self.feat_matrix=feat_matrix
-        self.latent_representation, self.mu, self.sigma=self.encoder.encode(adj_matrix, feat_matrix)
+        self.latent_representation, self.mu, self.sigma, self.epsilon=self.encoder.encode(adj_matrix, feat_matrix)
         if self.decoder_type=="inner":
             self.generated_prob, self.Z=self.decoder.runDecoder(self.latent_representation)
         if self.decoder_type=="bp":
             self.generated_prob, self.Z=self.decoder.runDecoder(self.latent_representation, self.Rmatrix)
             
-        return self.latent_representation, self.generated_result
+        return self.latent_representation, self.generated_prob
     
+    #SIG-VAE loss : https://github.com/YH-UtMSB/sigvae-torch/blob/master/optimizer.py
+    def loss(self):
+        #mean(logp(zj))
+        log_prior_kernel=torch.sum(self.Z.pow(2)/2.0, dim=[1,2]).mean()
+        
+        
+        return 0
+    '''
     #VAE loss : https://github.com/kampta/pytorch-distributions/blob/master/gaussian_vae.py
     def loss(self, input, reconstructed_input, qz):
-<<<<<<< HEAD
         K=2000
         J=150
         eps=1e-10
@@ -269,10 +271,9 @@ class SIGVAE_GIN(nn.Module):
         #KLD=torch.distributions.kl_divergence(qz, pz).mean()
         
         #return BCE + KLD
-=======
         BCE=nn.Functional.binary_cross_entropy(reconstructed_input, input.view(-1, input.size(0)), reduction='sum')
         pz=torch.normal.Normal(torch.zeros_like(qz.loc), torch.ones_like(qz.scale))
         KLD=torch.distributions.kl_divergence(qz, pz).sum()
         
         return BCE + KLD
->>>>>>> 19f1df3acf29006ec1e4ba40d102f92e1a21cb2a
+        '''
