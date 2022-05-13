@@ -63,6 +63,7 @@ class GIN(nn.Module):
         else:
             epsilon=torch.zeros(self.sample_size, self.N, self.noise_dim)
             temp=torch.cat((self.featMatrix, epsilon, h), 1)
+<<<<<<< HEAD
         
         if self.sample_size>=1:
             outputTensor=torch.zeros([self.sample_size])
@@ -75,6 +76,20 @@ class GIN(nn.Module):
                     temp=torch.mean(temp, dim=0) #Mean READOUT
                 outputTensor[i]=temp
         
+=======
+        
+        if self.sample_size>=1:
+            outputTensor=torch.zeros([self.sample_size])
+            self.adjMatrixNumpy=torch.clone(self.adjMatrix).numpy()
+            for i in range(self.sample_size):
+                self.tempNumpy=torch.clone(temp[i,:,:]).numpy()
+                self.inputGraphGIN=graph_generator(self.adjMatrixNumpy, self.tempNumpy) 
+                for layer in self.GINLayers:       
+                    temp=layer.forward(self.inputGraphGIN, temp, edge_weight=None)
+                    temp=torch.mean(temp, dim=0) #Mean READOUT
+                outputTensor[i]=temp
+        
+>>>>>>> f80127138a1bffbd13b632d108de93f4abe6ebf2
         #for GINmu and GINsigma
         if self.sample_size==0:
             self.adjMatrixNumpy=torch.clone(self.adjMatrix).numpy()
@@ -110,7 +125,11 @@ class BPDecoder(nn.Module):
         #self.distribution=distribution
         self.rk_logit=Parameter(torch.FloatTensor(torch.size([z_dim, z_dim])))
     #return logit
+<<<<<<< HEAD
+    def runDecoder(self, Z):
+=======
     def runDecoder(self, Z, R):
+>>>>>>> f80127138a1bffbd13b632d108de93f4abe6ebf2
         self.rk=torch.nn.Sigmoid(self.rk_logit)
         Z=self.dropout(Z)
         temp=torch.transpose(torch.clone(Z), 1, 2)
@@ -152,8 +171,19 @@ class Encoder(nn.Module):
         
         #sample_n in the original tensorflow code
         param=torch.normal(mean=0, std=1)
-        Z=self.mu+param*self.sigma
         
+<<<<<<< HEAD
+        #Z is equal to emb in the original code
+        Z=embedding_mu+param*embedding_sigma
+        
+        return Z, self.mu, self.sigma, epsilon
+    
+class SIGVAE_GIN(nn.Module):
+    def __init__(self, Lu, Lmu, Lsigma, input_dim, output_dim_u, output_dim_mu, output_dim_sigma, K, J, noise_dim=64, decoder_type="inner", activation=nn.ReLU, dropout=0):
+        super(SIGVAE_GIN, self)._init__()
+        self.decoder_type=decoder_type
+        #self.Rmatrix=Rmatrix
+=======
         return Z, self.mu, self.sigma, epsilon
     
 class SIGVAE_GIN(nn.Module):
@@ -161,6 +191,7 @@ class SIGVAE_GIN(nn.Module):
         super(SIGVAE_GIN, self)._init__()
         self.decoder_type=decoder_type
         self.Rmatrix=Rmatrix
+>>>>>>> f80127138a1bffbd13b632d108de93f4abe6ebf2
         self.encoder=Encoder(Lu, Lmu, Lsigma, input_dim, output_dim_u, output_dim_mu, output_dim_sigma, K, J, noise_dim=64, activation=activation, dropout=dropout)
         self.K=K
         self.J=J
@@ -181,16 +212,80 @@ class SIGVAE_GIN(nn.Module):
             self.generated_prob, self.Z=self.decoder.runDecoder(self.latent_representation)
         if self.decoder_type=="bp":
             self.generated_prob, self.Z=self.decoder.runDecoder(self.latent_representation, self.Rmatrix)
+<<<<<<< HEAD
+        return self.latent_representation, self.generated_prob
+    
+    def get_rec(self, norm_constant, weight, adj_matrix, generated_prob):
+        log_likelihood=torch.nn.functional.binary_cross_entropy_with_logits(generated_prob, adj_matrix, wieght=weight)
+        rec=norm_constant * log_likelihood
+        #log_likelihood=norm_constant*(weight*adj_matrix*torch.log(generated_prob)+(1-adj_matrix)*torch.log(1-generated_prob))
+        return -rec.mean()
+        
+=======
             
         return self.latent_representation, self.generated_prob
+>>>>>>> f80127138a1bffbd13b632d108de93f4abe6ebf2
     
     #SIG-VAE loss : https://github.com/YH-UtMSB/sigvae-torch/blob/master/optimizer.py
     def loss(self):
         #mean(logp(zj))
+<<<<<<< HEAD
+        N=self.adj_matrix.size(0)
+        J, N, z_dim=self.Z.shape
+        K=self.mu.size(0)-J
+        mu_mix=self.mu[:K, :]
+        mu_emb=self.mu[K:, :]
+        sigma_mix=self.sigma[:K, :]
+        sigma_emb=self.sigma[K:, :]
+
+        weight=torch.tensor([float(N * N - self.adj_matrix.sum()) / self.adj_matrix.sum()])
+        norm=N*N/float((N*N-self.adj_matrix.sum())*2)
+        rec_costs=torch.stack([self.get_rec(norm, weight, self.adj_matrix, lr) for lr in torch.unbind(self.latent_representation, dim=0)])
+        rec_cost=rec_costs.mean()
+        log_prior_kernel=torch.sum(self.Z.pow(2)/2.0, dim=[1,2]).mean()
+        
+        Zcopy=torch.clone(self.Z)
+        Zcopy.view(J, 1, N, z_dim)
+        mu_mix=mu_mix.view(1, K, N, z_dim)
+        sigma_mix=sigma_mix.view(1, K, N, z_dim)
+        
+        log_post_kernel_JK=-torch.sum(
+            (((Zcopy-mu_mix)/(sigma_mix+1e-6))**2)/2, dim=[-2, -1]
+        )
+        
+        log_post_kernel_JK += -torch.sum(
+            (sigma_mix+1e-6).log(), dim=[-2, -1]
+        )
+        
+        log_post_kernel_J = - torch.sum(
+        Zcopy.pow(2)/2, dim=[-2,-1]
+        )
+        
+        log_post_kernel_J += - torch.sum(
+            (sigma_emb + 1e-6).log(), dim = [-2,-1]
+        )
+        
+        log_post_kernel_J = log_post_kernel_J.view(-1,1)
+
+
+        # bind up log_post_ker_JK and log_post_ker_J into log_post_ker, the shape of result tensor is [J, K+1].
+        log_post_kernel = torch.cat([log_post_kernel_JK, log_post_kernel_J], dim=-1)
+
+        # apply "log-mean-exp" to the above tensor
+        log_post_kernel -= np.log(K + 1.) / J
+        
+        # average over J items.
+        log_posterior_kernel = torch.logsumexp(log_post_kernel, dim=-1).mean()
+
+        
+        
+        return rec_cost, log_prior_kernel, log_posterior_kernel
+=======
         log_prior_kernel=torch.sum(self.Z.pow(2)/2.0, dim=[1,2]).mean()
         
         
         return 0
+>>>>>>> f80127138a1bffbd13b632d108de93f4abe6ebf2
     '''
     #VAE loss : https://github.com/kampta/pytorch-distributions/blob/master/gaussian_vae.py
     def loss(self, input, reconstructed_input, qz):
