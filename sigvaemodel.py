@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
-import scipy as sp
+import scipy.sparse as sp
 import networkx as nx
 
 #Generating dgl.graph from adjacency matrix & feature matrix
@@ -12,15 +12,18 @@ import networkx as nx
 #subX : dimension 1,2 of input matrix of GIN - do not consider sample size
 def graph_generator(A, subX):
     tempGraph=nx.from_numpy_array(A)
-    
-    for index in A.size(0):
-        tempGraph.nodes[index]=subX[index]
+    subXd=dict()
+    for i in range(subX.shape[0]):
+        subXd[i]=subX[i]
+        
+    for index in range(A.shape[0]):
+        tempGraph.nodes[index].update(subXd)
     tempGraph=tempGraph.to_directed()
         
     finalGraph=dgl.from_networkx(tempGraph, node_attrs=['node_feature'], edge_attrs=['weight'])
     return finalGraph
 
-#Shape of X : [sample_size, N, M]
+#Shape of input X : [1, N, M]
 #output_dims=[output dim of 1st layer, output dim of 2nd layer, ..., D]
 #GINConv : Readout not implemented - we should apply readout to the result
 #Shape of final result : [sample_size, N, D]
@@ -36,7 +39,7 @@ class GIN(nn.Module):
         self.dropoutRate=dropout
         self.sample_size=sample_size
         
-        if self.output_dims.size(0)!=L:
+        if len(self.output_dims)!=L:
             raise Exception("number of layer not matched to output dimensions")
         
         self.GINLayers.append(dgl.nn.GINConv(apply_func=nn.Linear(self.input_dim+self.noise_dim,self.output_dims[0]), aggregator_type="sum", init_eps=0, learn_eps=True,activation=self.activation))
@@ -45,24 +48,28 @@ class GIN(nn.Module):
     
     def forward(self, A, X, h):
         self.adjMatrix=A
-        self.featMatrix=X
-        self.N=X.size(1)
-        self.h=h
+        self.featMatrix=X.expand(self.sample_size, -1, -1)
+        self.N=X.shape[1]
+        self.h=h.expand(self.sample_size, self.N, -1)
         #self.X1=torch.tile(torch.unsqueeze(X, axis=1), [1,K,1]) #(N,K,M)
         
-        if X.size(0)!=self.sample_size:
-            raise Exception("sample size not matched to the input.shape[0]")
+        if len(X.shape)!=3:
+            raise Exception("dimension of input feature matrix is not 2")
+        #if X.shape[0]!=self.sample_size:
+        #    raise Exception("sample size not matched to the input.shape[0]")
         
         #epsilon generation
-        Bernoulli=torch.distributions.Bernoulli(torch.tensor[0.5])
+        bernoulli=torch.distributions.Bernoulli(torch.tensor([0.5]))
         if self.noise_dim>0:
-            epsilon=Bernoulli.rsample(torch.Size(self.sample_size, self.N, self.noise_dim))
-            #epsilon=Bernoulli.rsample(torch.Size([self.N,self.K,self.noise_dim]))
-            temp=torch.cat((self.featMatrix, epsilon, h), 1)
-            #temp=torch.cat((epsilon,self.X1),axis=2) #shape : (N, K, M+noise_dim)
+            epsilon=bernoulli.sample(torch.Size([self.sample_size, self.N, self.noise_dim])).view(self.sample_size, self.N, self.noise_dim)
+            print(self.featMatrix.shape)
+            print(epsilon.shape)
+            print(self.h.shape)
+            temp=torch.cat((self.featMatrix, epsilon, self.h), axis=2)
+
         else:
             epsilon=torch.zeros(self.sample_size, self.N, self.noise_dim)
-            temp=torch.cat((self.featMatrix, epsilon, h), 1)
+            temp=torch.cat((self.featMatrix, epsilon, self.h), axis=2)
         
         if self.sample_size>=1:
             outputTensor=torch.zeros([self.sample_size])
@@ -132,12 +139,12 @@ class Encoder(nn.Module):
         self.J=J
         self.noise_dim=noise_dim
         self.GINu=GIN(Lu, input_dim=input_dim, output_dims=output_dim_u, noise_dim=noise_dim, sample_size=(self.K+self.J), activation=activation, dropout=0)
-        self.GINmu=GIN(Lmu, input_dim=output_dim_u, output_dims=output_dim_mu, noise_dim=0, sample_size=0, activation=lambda x : x, dropout=0)
-        self.GINsigma=GIN(Lsigma, input_dim=output_dim_u, output_dims=output_dim_sigma, noise_dim=0, sample_size=0, activation=lambda x : x, dropout=0)
+        self.GINmu=GIN(Lmu, input_dim=output_dim_u[-1], output_dims=output_dim_mu, noise_dim=0, sample_size=0, activation=lambda x : x, dropout=0)
+        self.GINsigma=GIN(Lsigma, input_dim=output_dim_u[-1], output_dims=output_dim_sigma, noise_dim=0, sample_size=0, activation=lambda x : x, dropout=0)
         
-        
+    #input X's shape : (1, N, M)
     def encode(self, A, X):
-        h=0
+        h=torch.zeros(1, 1, 1)
         h, epsilon=self.GINu.forward(A, X, h)
         hL=torch.clone(h)
         #hL's shape : (K+J, N, output_dim_u)
@@ -168,7 +175,7 @@ class SIGVAE_GIN(nn.Module):
         self.J=J
         self.noise_dim=noise_dim #ndim in sigvae-torch
         #to make hiddenx + hiddene equivalent to x||e
-        self.reweight=((self.noise_dim+output_dim_u) / (input_dim+output_dim_u))**(0.5)    
+        #self.reweight=((self.noise_dim+output_dim_u) / (input_dim+output_dim_u))**(0.5)    
         
         if self.decoder_type=="inner":
             self.decoder=InnerProductDecoder(dropout=dropout)
@@ -182,10 +189,5 @@ class SIGVAE_GIN(nn.Module):
         if self.decoder_type=="inner":
             self.generated_prob, self.Z=self.decoder.runDecoder(self.latent_representation)
         if self.decoder_type=="bp":
-            self.generated_prob, self.Z=self.decoder.runDecoder(self.latent_representation, self.Rmatrix)
+            self.generated_prob, self.Z=self.decoder.runDecoder(self.latent_representation)
         return self.generated_prob, self.mu, self.sigma, self.latent_representation, self.Z, self.epsilon
-    
-    
-        
-    
-   
