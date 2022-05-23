@@ -3,13 +3,13 @@ import numpy as np
 
 
 def get_rec(norm_constant, weight, adj_matrix, generated_prob):
-        log_likelihood=torch.nn.functional.binary_cross_entropy_with_logits(generated_prob, adj_matrix, wieght=weight)
+        log_likelihood=torch.nn.functional.binary_cross_entropy_with_logits(generated_prob, adj_matrix, weight=weight)
         rec=norm_constant * log_likelihood
         #log_likelihood=norm_constant*(weight*adj_matrix*torch.log(generated_prob)+(1-adj_matrix)*torch.log(1-generated_prob))
-        return -rec.mean()
+        return rec.mean()
 
 #SIG-VAE loss : https://github.com/YH-UtMSB/sigvae-torch/blob/master/optimizer.py
-def loss(adj_matrix, mu, sigma, Z, latent_representation):
+def loss(generated_prob, adj_matrix, mu, sigma, Z, epsilon, latent_representation, device='cuda'):
         #mean(logp(zj))
     N=adj_matrix.size(0)
     J, N, z_dim=Z.shape
@@ -19,14 +19,14 @@ def loss(adj_matrix, mu, sigma, Z, latent_representation):
     sigma_mix=sigma[:K, :]
     sigma_emb=sigma[K:, :]
 
-    weight=torch.tensor([float(N * N - adj_matrix.sum()) / adj_matrix.sum()])
+    weight=torch.tensor([float(N * N - adj_matrix.sum()) / adj_matrix.sum()]).to(device)
     norm=N*N/float((N*N-adj_matrix.sum())*2)
-    rec_costs=torch.stack([get_rec(norm, weight, adj_matrix, lr) for lr in torch.unbind(latent_representation, dim=0)])
+    rec_costs=torch.stack([get_rec(norm, weight, adj_matrix, lr) for lr in torch.unbind(generated_prob, dim=0)])
     rec_cost=rec_costs.mean()
     log_prior_kernel=torch.sum(Z.pow(2)/2.0, dim=[1,2]).mean()
     
     Zcopy=torch.clone(Z)
-    Zcopy.view(J, 1, N, z_dim)
+    Zcopy=Zcopy.view(J, 1, N, z_dim)
     mu_mix=mu_mix.view(1, K, N, z_dim)
     sigma_mix=sigma_mix.view(1, K, N, z_dim)
     
@@ -39,7 +39,7 @@ def loss(adj_matrix, mu, sigma, Z, latent_representation):
     )
     
     log_post_kernel_J = - torch.sum(
-    Zcopy.pow(2)/2, dim=[-2,-1]
+    epsilon.pow(2)/2, dim=[-2,-1]
     )
     
     log_post_kernel_J += - torch.sum(

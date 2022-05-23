@@ -10,31 +10,16 @@ import networkx as nx
 #Generating dgl.graph from adjacency matrix & feature matrix
 #node_features : feature matrix
 #subX : dictionary - key : 'feature', value : dimension 1,2 of input matrix of GIN - do not consider sample size
-def graph_generator(A, subX):
-    print("tempGraph")
-    tempGraph=nx.from_numpy_array(A, create_using=nx.DiGraph)
-    #subXd=dict()
-    #for i in range(subX.shape[0]):
-    #    subXd[i]=subX[i]
-    #print("asdf")
-    #subXd['feature']=subXd
-    #print(tempGraph.nodes())
-    for node in tempGraph.nodes():
-      print("nodes")
-      for feat, featVal in subX.items():
-        print(feat)
-        print(featVal)
-        print("ReadHere")
-        tempGraph.nodes[node][feat]=featVal[node]
-        print("pass??")
-    print(tempGraph.size())
-    #tempGraph=tempGraph.to_directed()
-    #print(tempGraph)
-    node_attr=list(subX.keys())
-    print(node_attr)
-    finalGraph=dgl.from_networkx(tempGraph, node_attrs=node_attr, edge_attrs=['weight'])
-    
-    #finalGraph=dgl.from_networkx(tempGraph, node_attrs=['node_feature'], edge_attrs=['weight'])
+def graph_generator(A, X):
+    #tempGraph=nx.from_numpy_array(A, create_using=nx.DiGraph)
+    #for node in tempGraph.nodes():
+    #  for feat, featVal in subX.items():
+    #    tempGraph.nodes[node][feat]=featVal[node]
+    #node_attr=list(subX.keys())
+    #finalGraph=dgl.from_networkx(tempGraph, node_attrs=node_attr, edge_attrs=['weight'])
+    src, dst=np.nonzero(A)
+    finalGraph=dgl.graph((src, dst)).to('cuda')
+    finalGraph.ndata['feature']=X
     return finalGraph
 
 #Shape of input X : [1, N, M]
@@ -42,7 +27,7 @@ def graph_generator(A, subX):
 #GINConv : Readout not implemented - we should apply readout to the result
 #Shape of final result : [sample_size, N, D]
 class GIN(nn.Module):
-    def __init__(self, L, input_dim, output_dims, noise_dim, sample_size, activation, dropout=0):
+    def __init__(self, L, input_dim, output_dims, noise_dim, sample_size, device, activation, dropout=0):
         super(GIN, self).__init__()
         self.numLayer=L
         self.input_dim=input_dim
@@ -52,60 +37,64 @@ class GIN(nn.Module):
         self.GINLayers=nn.ModuleList()
         self.dropoutRate=dropout
         self.sample_size=sample_size
+        self.device=device
         
         if len(self.output_dims)!=L:
             raise Exception("number of layer not matched to output dimensions")
         
-        self.GINLayers.append(dgl.nn.GINConv(apply_func=nn.Linear(self.input_dim+self.noise_dim,self.output_dims[0]), aggregator_type="sum", init_eps=0, learn_eps=True,activation=self.activation))
+        self.GINLayers.append(dgl.nn.GINConv(apply_func=nn.Linear(self.input_dim+self.noise_dim+32,self.output_dims[0]), aggregator_type="sum", init_eps=0, learn_eps=True, activation=self.activation).to(self.device))
         for i in range(L-1):
-            self.GINLayers.append(dgl.nn.GINConv(apply_func=nn.Linear(self.output_dims[i], self.output_dims[i+1]),aggregator_type="sum", init_eps=0, learn_eps=True,activation=self.activation))
+            self.GINLayers.append(dgl.nn.GINConv(apply_func=nn.Linear(self.output_dims[i], self.output_dims[i+1]),aggregator_type="sum", init_eps=0, learn_eps=True, activation=self.activation).to(self.device))
     
+    #return shape : (sample_size, N,D)
     def forward(self, A, X, h):
-        print("GINForward")
         self.adjMatrix=A
-        self.featMatrix=X.expand(self.sample_size, -1, -1)
+        self.featMatrix=X.expand(self.sample_size, -1, -1).to(self.device)
         self.N=X.shape[1]
-        self.h=h.expand(self.sample_size, self.N, -1)
+        self.h=h.expand(self.sample_size, self.N, 32).to(self.device)
         #self.X1=torch.tile(torch.unsqueeze(X, axis=1), [1,K,1]) #(N,K,M)
         
         if len(X.shape)!=3:
             raise Exception("dimension of input feature matrix is not 2")
         #if X.shape[0]!=self.sample_size:
         #    raise Exception("sample size not matched to the input.shape[0]")
-        
+       
         #epsilon generation
         bernoulli=torch.distributions.Bernoulli(torch.tensor([0.5]))
         if self.noise_dim>0:
-            epsilon=bernoulli.sample(torch.Size([self.sample_size, self.N, self.noise_dim])).view(self.sample_size, self.N, self.noise_dim)
-            print(self.featMatrix.shape)
-            print(epsilon.shape)
-            print(self.h.shape)
-            temp=torch.cat((self.featMatrix, epsilon, self.h), axis=2)
-
+            epsilon=bernoulli.sample(torch.Size([self.sample_size, self.N, self.noise_dim])).view(self.sample_size, self.N, self.noise_dim).to(self.device)
+            temp=torch.cat((self.featMatrix, epsilon, self.h), axis=2).to(self.device)
         else:
-            epsilon=torch.zeros(self.sample_size, self.N, self.noise_dim)
-            temp=torch.cat((self.featMatrix, epsilon, self.h), axis=2)
+            epsilon=torch.zeros(self.sample_size, self.N, self.noise_dim).to(self.device)
+            temp=torch.cat((self.featMatrix, epsilon, self.h), axis=2).to(self.device)
         
+        #for all three GINs : GINu and GINmu and GINsigma
         if self.sample_size>=1:
-            outputTensor=torch.zeros([self.sample_size])
-            self.adjMatrixNumpy=torch.clone(self.adjMatrix).numpy()
+            outputTensor=torch.zeros([self.sample_size, self.N, self.output_dims[-1]]).to(self.device)
+            #self.adjMatrixNumpy=torch.clone(self.adjMatrix)
             for i in range(self.sample_size):
-                self.tempNumpy=torch.clone(temp[i,:,:]).numpy()
-                self.inputGraphGIN=graph_generator(self.adjMatrixNumpy, {'feature':self.tempNumpy}) 
-                for layer in self.GINLayers:       
-                    temp=layer.forward(self.inputGraphGIN, temp, edge_weight=None)
-                    temp=torch.mean(temp, dim=0) #Mean READOUT
-                outputTensor[i]=temp
-        
-        #for GINmu and GINsigma
+                tempdim12=temp[i,:,:]
+                inputGraphGIN=graph_generator(self.adjMatrix.cpu().numpy(), tempdim12) 
+                #print(self.inputGraphGIN.type())
+                self.inputGraphGIN=inputGraphGIN.to(self.device)
+                for layer in self.GINLayers:    
+                 
+                  tempdim12=layer.forward(self.inputGraphGIN, tempdim12, edge_weight=None).to(self.device)
+                  tempdim12=torch.mean(tempdim12, dim=0) #Mean READOUT
+                  
+                outputTensor[i]=tempdim12
+        '''
         if self.sample_size==0:
-            self.adjMatrixNumpy=torch.clone(self.adjMatrix).numpy()
-            self.inputGraphGIN=graph_generator(self.adjMatrixNumpy, {'feature':self.tempNumpy}) 
+            #self.adjMatrixNumpy=torch.clone(self.adjMatrix).numpy()
+            tempdim12=temp.squeeze(0)
+            self.inputGraphGIN=graph_generator(self.adjMatrix, {'feature':self.tempdim12}) 
+            #tempNumpy=temp.squeeze(0).numpy()
             for layer in self.GINLayers:       
-                temp=layer.forward(self.inputGraphGIN, temp, edge_weight=None)
-                temp=torch.mean(temp, dim=0) #Mean READOUT
-            outputTensor=temp
+                tempdim12=layer.forward(self.inputGraphGIN, tempdim12, edge_weight=None)
+                tempdim12=torch.mean(tempdim12, dim=0) #Mean READOUT
+            outputTensor=tempdim12
         #Return shape : (sample_size, N,D) for GINu / (N,D) for GINmu and GINsigma
+        '''
         return self.activation(outputTensor), epsilon
 
 #output : reconstructed adjacency amtrix
@@ -120,9 +109,9 @@ class InnerProductDecoder(nn.Module):
     def runDecoder(self, Z):
         Z=self.dropout(Z)
         temp=torch.transpose(torch.clone(Z), 1, 2)
-        result=torch.mm(Z,temp)
+        result=torch.matmul(Z,temp)
         #A=self.distribution(temp=1,logits=self.activation(result))
-        return torch.nn.Sigmoid(result), Z
+        return torch.sigmoid(result), Z
     
 class BPDecoder(nn.Module):
     def __init__(self, z_dim, dropout=0):
@@ -136,7 +125,7 @@ class BPDecoder(nn.Module):
         self.rk=torch.nn.Sigmoid(self.rk_logit)
         Z=self.dropout(Z)
         temp=torch.transpose(torch.clone(Z), 1, 2)
-        sigmaInput=self.rk.view(1, self.z_dim, self.z_dim)*torch.mm(Z, temp)
+        sigmaInput=self.rk.view(1, self.z_dim, self.z_dim)*torch.matmul(Z, temp)
         lambdaterm=torch.exp(torch.sum(sigmaInput))
         #A=self.distribution(temp=1, logits=1-torch.exp(-1*lambdaterm))
         return 1-torch.exp(-1*lambdaterm), Z
@@ -148,24 +137,26 @@ class BPDecoder(nn.Module):
 #output_dim_mu : output_dim vector of GINmu
 #output_dim_sigma : output_dim vector of GINsigma
 class Encoder(nn.Module):
-    def __init__(self, Lu, Lmu, Lsigma, input_dim, output_dim_u, output_dim_mu, output_dim_sigma, K, J, noise_dim=64, activation=nn.ReLU, dropout=0) :
+    def __init__(self, Lu, Lmu, Lsigma, input_dim, output_dim_u, output_dim_mu, output_dim_sigma, K, J, device, noise_dim=64, activation=nn.functional.relu, dropout=0) :
         super(Encoder, self).__init__()
         self.K=K
         self.J=J
         self.noise_dim=noise_dim
-        self.GINu=GIN(Lu, input_dim=input_dim, output_dims=output_dim_u, noise_dim=noise_dim, sample_size=(self.K+self.J), activation=activation, dropout=0)
-        self.GINmu=GIN(Lmu, input_dim=output_dim_u[-1], output_dims=output_dim_mu, noise_dim=0, sample_size=0, activation=lambda x : x, dropout=0)
-        self.GINsigma=GIN(Lsigma, input_dim=output_dim_u[-1], output_dims=output_dim_sigma, noise_dim=0, sample_size=0, activation=lambda x : x, dropout=0)
+        self.device=device
+        self.GINu=GIN(Lu, input_dim=input_dim, output_dims=output_dim_u, noise_dim=noise_dim, sample_size=(self.K+self.J), device=device, activation=activation, dropout=0)
+        self.GINmu=GIN(Lmu, input_dim=input_dim, output_dims=output_dim_mu, noise_dim=0, sample_size=(self.K+self.J), device=device, activation=lambda x : x, dropout=0)
+        self.GINsigma=GIN(Lsigma, input_dim=input_dim, output_dims=output_dim_sigma, noise_dim=0, sample_size=(self.K+self.J), device=device, activation=lambda x : x, dropout=0)
         
     #input X's shape : (1, N, M)
     def encode(self, A, X):
-        h=torch.zeros(1, 1, 1)
-        print("Encode")
+        h=torch.zeros(1, 1, 1).to(self.device)
+        
         h, epsilon=self.GINu.forward(A, X, h)
         hL=torch.clone(h)
         #hL's shape : (K+J, N, output_dim_u)
         self.mu, zero_eps=self.GINmu.forward(A, X, hL)
-        self.sigma, zero_eps=torch.exp(self.GINsigma.forward(A, X, hL)/2.0)
+        self.sigma, zero_eps=self.GINsigma.forward(A, X, hL)
+        self.sigma=torch.exp(self.sigma * 0.5)
         
         embedding_mu=self.mu[self.K:,:]
         embedding_sigma=self.sigma[self.K:,:]
@@ -174,22 +165,25 @@ class Encoder(nn.Module):
             raise Exception("mu and sigma have different dimensions")
         
         #sample_n in the original tensorflow code
-        param=torch.normal(mean=0, std=1)
+        stdTensor=torch.ones(embedding_sigma.shape).to(self.device)
+        param=torch.normal(mean=0.0, std=stdTensor)
         
         #Z is equal to emb in the original code
-        Z=embedding_mu+param*embedding_sigma
+        Z=embedding_mu+param*embedding_sigma.to(self.device)
+        epsilon=param
         
         return Z, self.mu, self.sigma, epsilon
     
 class SIGVAE_GIN(nn.Module):
-    def __init__(self, Lu, Lmu, Lsigma, input_dim, output_dim_u, output_dim_mu, output_dim_sigma, K, J, noise_dim=64, decoder_type="inner", activation=nn.ReLU, dropout=0):
+    def __init__(self, Lu, Lmu, Lsigma, input_dim, output_dim_u, output_dim_mu, output_dim_sigma, K, J, device, noise_dim=64, decoder_type="inner", activation=nn.functional.relu, dropout=0):
         super(SIGVAE_GIN, self).__init__()
         self.decoder_type=decoder_type
         #self.Rmatrix=Rmatrix
-        self.encoder=Encoder(Lu, Lmu, Lsigma, input_dim, output_dim_u, output_dim_mu, output_dim_sigma, K, J, noise_dim=64, activation=activation, dropout=dropout)
+        self.encoder=Encoder(Lu, Lmu, Lsigma, input_dim, output_dim_u, output_dim_mu, output_dim_sigma, K, J, device, noise_dim=64, activation=activation, dropout=dropout)
         self.K=K
         self.J=J
         self.noise_dim=noise_dim #ndim in sigvae-torch
+        self.device=device
         #to make hiddenx + hiddene equivalent to x||e
         #self.reweight=((self.noise_dim+output_dim_u) / (input_dim+output_dim_u))**(0.5)    
         
@@ -201,7 +195,6 @@ class SIGVAE_GIN(nn.Module):
     def forward(self, adj_matrix, feat_matrix):
         self.adj_matrix=adj_matrix
         self.feat_matrix=feat_matrix
-        print("Done")
         self.latent_representation, self.mu, self.sigma, self.epsilon=self.encoder.encode(adj_matrix, feat_matrix)
         if self.decoder_type=="inner":
             self.generated_prob, self.Z=self.decoder.runDecoder(self.latent_representation)
