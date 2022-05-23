@@ -9,18 +9,32 @@ import networkx as nx
 
 #Generating dgl.graph from adjacency matrix & feature matrix
 #node_features : feature matrix
-#subX : dimension 1,2 of input matrix of GIN - do not consider sample size
+#subX : dictionary - key : 'feature', value : dimension 1,2 of input matrix of GIN - do not consider sample size
 def graph_generator(A, subX):
-    tempGraph=nx.from_numpy_array(A)
-    subXd=dict()
-    for i in range(subX.shape[0]):
-        subXd[i]=subX[i]
-        
-    for index in range(A.shape[0]):
-        tempGraph.nodes[index].update(subXd)
-    tempGraph=tempGraph.to_directed()
-        
-    finalGraph=dgl.from_networkx(tempGraph, node_attrs=['node_feature'], edge_attrs=['weight'])
+    print("tempGraph")
+    tempGraph=nx.from_numpy_array(A, create_using=nx.DiGraph)
+    #subXd=dict()
+    #for i in range(subX.shape[0]):
+    #    subXd[i]=subX[i]
+    #print("asdf")
+    #subXd['feature']=subXd
+    #print(tempGraph.nodes())
+    for node in tempGraph.nodes():
+      print("nodes")
+      for feat, featVal in subX.items():
+        print(feat)
+        print(featVal)
+        print("ReadHere")
+        tempGraph.nodes[node][feat]=featVal[node]
+        print("pass??")
+    print(tempGraph.size())
+    #tempGraph=tempGraph.to_directed()
+    #print(tempGraph)
+    node_attr=list(subX.keys())
+    print(node_attr)
+    finalGraph=dgl.from_networkx(tempGraph, node_attrs=node_attr, edge_attrs=['weight'])
+    
+    #finalGraph=dgl.from_networkx(tempGraph, node_attrs=['node_feature'], edge_attrs=['weight'])
     return finalGraph
 
 #Shape of input X : [1, N, M]
@@ -47,6 +61,7 @@ class GIN(nn.Module):
             self.GINLayers.append(dgl.nn.GINConv(apply_func=nn.Linear(self.output_dims[i], self.output_dims[i+1]),aggregator_type="sum", init_eps=0, learn_eps=True,activation=self.activation))
     
     def forward(self, A, X, h):
+        print("GINForward")
         self.adjMatrix=A
         self.featMatrix=X.expand(self.sample_size, -1, -1)
         self.N=X.shape[1]
@@ -76,7 +91,7 @@ class GIN(nn.Module):
             self.adjMatrixNumpy=torch.clone(self.adjMatrix).numpy()
             for i in range(self.sample_size):
                 self.tempNumpy=torch.clone(temp[i,:,:]).numpy()
-                self.inputGraphGIN=graph_generator(self.adjMatrixNumpy, self.tempNumpy) 
+                self.inputGraphGIN=graph_generator(self.adjMatrixNumpy, {'feature':self.tempNumpy}) 
                 for layer in self.GINLayers:       
                     temp=layer.forward(self.inputGraphGIN, temp, edge_weight=None)
                     temp=torch.mean(temp, dim=0) #Mean READOUT
@@ -85,7 +100,7 @@ class GIN(nn.Module):
         #for GINmu and GINsigma
         if self.sample_size==0:
             self.adjMatrixNumpy=torch.clone(self.adjMatrix).numpy()
-            self.inputGraphGIN=graph_generator(self.adjMatrixNumpy, self.tempNumpy) 
+            self.inputGraphGIN=graph_generator(self.adjMatrixNumpy, {'feature':self.tempNumpy}) 
             for layer in self.GINLayers:       
                 temp=layer.forward(self.inputGraphGIN, temp, edge_weight=None)
                 temp=torch.mean(temp, dim=0) #Mean READOUT
@@ -145,6 +160,7 @@ class Encoder(nn.Module):
     #input X's shape : (1, N, M)
     def encode(self, A, X):
         h=torch.zeros(1, 1, 1)
+        print("Encode")
         h, epsilon=self.GINu.forward(A, X, h)
         hL=torch.clone(h)
         #hL's shape : (K+J, N, output_dim_u)
@@ -185,6 +201,7 @@ class SIGVAE_GIN(nn.Module):
     def forward(self, adj_matrix, feat_matrix):
         self.adj_matrix=adj_matrix
         self.feat_matrix=feat_matrix
+        print("Done")
         self.latent_representation, self.mu, self.sigma, self.epsilon=self.encoder.encode(adj_matrix, feat_matrix)
         if self.decoder_type=="inner":
             self.generated_prob, self.Z=self.decoder.runDecoder(self.latent_representation)
