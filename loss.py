@@ -154,7 +154,6 @@ def loss(generated_prob, adj_matrix, mu, sigma, Z, epsilon, latent_representatio
       weight + (1-adj_orig_tile) * torch.log(1 - reconstruct_iw + eps), axis=[1,2])
 
     loss_iw0 = -torch.logsumexp(log_lik_iw+(log_prior_iw-log_H_iw)*WU/N+eps, dim=0, keepdim=False) + torch.log(torch.cuda.FloatTensor([K]))
-    loss_iw=loss_iw0
     #BCE=nn.Functional.binary_cross_entropy(reconstructed_input, input.view(-1, input.size(0)), reduction='mean')
     #pz=torch.normal.Normal(torch.zeros_like(qz.loc), torch.ones_like(qz.scale))
     #KLD=torch.distributions.kl_divergence(qz, pz).mean()
@@ -164,4 +163,4 @@ def loss(generated_prob, adj_matrix, mu, sigma, Z, epsilon, latent_representatio
     #pz=torch.normal.Normal(torch.zeros_like(qz.loc), torch.ones_like(qz.scale))
     #KLD=torch.distributions.kl_divergence(qz, pz).sum()
     
-    return loss_iw
+    return loss_iw0
